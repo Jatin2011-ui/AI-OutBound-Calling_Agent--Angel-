@@ -1,0 +1,444 @@
+﻿================================================================================
+  AI OUTBOUND CALLING AGENT -- PROJECT OVERVIEW
+  Agent Name  : Angel
+  Company     : Jatin.Pvt.Ltd
+  Version     : 0.1.0
+================================================================================
+
+
+--------------------------------------------------------------------------------
+1. BRIEF EXPLANATION
+--------------------------------------------------------------------------------
+
+This is a real-time AI-powered outbound calling agent that autonomously places
+phone calls, speaks to the called party using a human-like voice, understands
+spoken replies, and handles the conversation end-to-end without any human
+operator involvement.
+
+When a call is triggered (via REST API), the system dials the target number
+through Twilio. Once the call is answered, a two-way audio bridge opens:
+  - The caller's speech is captured and streamed to Deepgram for real-time
+    speech-to-text transcription.
+  - The transcribed text is fed into an LLM-powered agent (backed by Groq)
+    which decides what to say next.
+  - The agent's reply is synthesised back to speech using Deepgram TTS and
+    streamed as audio to the caller -- all in near real-time.
+
+The system supports contextualised conversations (appointment reminders,
+feedback surveys, etc.), memory retrieval from previous interactions, intent
+detection, and automatic escalation to human agents when needed.
+
+All call records, conversation transcripts, and summaries are persisted in a
+PostgreSQL database with pgvector for semantic memory search.
+
+
+--------------------------------------------------------------------------------
+2. TECH STACK
+--------------------------------------------------------------------------------
+
+LAYER                   TECHNOLOGY / LIBRARY
+----------------------- ------------------------------------------------------
+Web Framework           FastAPI >= 0.110  (async, OpenAPI, WebSocket support)
+ASGI Server             Uvicorn >= 0.29   (production-grade async server)
+Config & Validation     Pydantic v2 + pydantic-settings + python-dotenv
+
+LLM (Chat / Reasoning)  Groq SDK >= 0.11
+                          Model: openai/gpt-oss-120b
+                          Used for: turn-by-turn replies, call summarisation
+
+Agent Orchestration     LangGraph >= 0.2
+                          Custom node-based pipeline:
+                          greeting -> memory -> intent -> response
+                          -> escalation -> closing
+
+Speech-to-Text (STT)    Deepgram Nova-2  (streaming WebSocket, nova-2 model)
+                          8 kHz mu-law encoding, real-time endpointing
+
+Text-to-Speech (TTS)    Deepgram Aura-2  (aura-2-asteria-en)
+                          Returns raw 8 kHz mu-law audio -- Twilio-compatible
+
+Telephony               Twilio Voice API
+                          Outbound calls, TwiML, Media Streams (WebSocket)
+                          Audio codec: G.711 mu-law, 8 kHz, mono
+
+Database (ORM)          SQLAlchemy 2.0 async + asyncpg
+                          Tables: calls, transcripts
+Database Engine         PostgreSQL 16
+Vector Extension        pgvector (semantic memory search, 384-dim embeddings)
+
+Embeddings (local)      sentence-transformers  (all-MiniLM-L6-v2, CPU)
+                          No external API -- runs fully on-device
+
+HTTP Tunneling          ngrok  (exposes localhost to Twilio's public webhooks)
+HTTP Client             httpx  (async, used for TTS requests and test scripts)
+WebSockets              websockets >= 12.0
+
+Testing                 pytest + pytest-asyncio + pytest-cov
+Containerisation        Docker + Docker Compose
+
+
+--------------------------------------------------------------------------------
+3. ARCHITECTURE
+--------------------------------------------------------------------------------
+
+HIGH-LEVEL COMPONENT MAP
+-------------------------
+
+  [Client / test_call.py]
+         |
+         |  REST POST /calls/initiate
+         v
+  [FastAPI App : port 8000]
+         |
+         |  Twilio REST API (place outbound call)
+         v
+  [TWILIO CLOUD]
+    Dials +91xxxxxxxxxx
+    On answer -> fetches TwiML from /webhooks/twilio/twiml
+    TwiML instructs: open Media Stream WebSocket to our server
+         |
+         |  WebSocket  wss://<ngrok>/ws/media-stream/<call_sid>
+         |  mu-law audio frames @ 20 ms intervals
+         v
+  [MediaStreamHandler  (one per live call)]
+    |
+    +-- _pump_twilio()
+    |     Receives mu-law frames from Twilio WebSocket
+    |     Forwards raw audio bytes to Deepgram STT
+    |
+    +-- _pump_stt()
+          Consumes transcribed utterances from Deepgram
+          On each speech_final=true event:
+            -> CallOrchestrator.on_caller_utterance(text)
+
+AGENT NODE PIPELINE (per caller utterance)
+-------------------------------------------
+
+  1. memory_retrieval_node
+       pgvector cosine-similarity search on past interactions
+       Injects relevant context into agent state
+
+  2. query_handler_node
+       Heuristic intent classifier
+       Detects: escalate_to_human | end_call | general_query
+
+  3a. escalation_node   (if should_escalate == True)
+        Posts to ESCALATION_WEBHOOK_URL (Slack/Teams)
+        Followed by closing_node
+
+  3b. closing_node      (if end_call intent or max turns reached)
+        Groq generates 2-3 sentence summary
+        Saves transcript + summary via CallPersister
+
+  3c. response_gen_node (normal turn)
+        Groq LLM chat completion (openai/gpt-oss-120b, max 200 tokens)
+        Returns agent reply text
+
+  Agent reply text
+       -> _speak(text)
+       -> Deepgram TTS HTTP POST  -> raw mu-law audio
+       -> Chunked into 20ms frames
+       -> Sent back to Twilio via WebSocket
+       -> Caller hears the agent's voice
+
+PERSISTENCE LAYER
+------------------
+
+  With PostgreSQL:
+    SqlCallRepository    -> stores call metadata
+    SqlCallPersister     -> stores transcript + summary on call end
+    MemoryStore          -> pgvector insert/search for semantic memory
+
+  Without PostgreSQL (degraded / dev mode):
+    InMemoryCallRepository  -> process-memory store (lost on restart)
+    InMemoryCallPersister   -> backed by above repository
+    Memory features disabled
+
+
+DIRECTORY STRUCTURE
+--------------------
+
+  calling-agent/
+  |-- app/
+  |   |-- main.py                   FastAPI app factory + lifespan
+  |   |-- config.py                 Pydantic Settings (all env vars)
+  |   |-- api/
+  |   |   |-- dependencies.py       Service registry, DI, singletons
+  |   |   +-- routes/
+  |   |       |-- calls.py          POST /calls/initiate, GET /calls/{id}
+  |   |       |-- webhooks.py       Twilio TwiML + status + WS handler
+  |   |       +-- health.py         GET /health
+  |   |-- agent/
+  |   |   |-- state.py              AgentState TypedDict + helpers
+  |   |   |-- graph.py              LangGraph compiled graph definition
+  |   |   +-- nodes/
+  |   |       |-- greeting.py       Opening utterance generation
+  |   |       |-- memory_retrieval.py   pgvector semantic memory lookup
+  |   |       |-- query_handler.py      Intent classification (heuristic)
+  |   |       |-- response_gen.py       Groq LLM turn response
+  |   |       |-- escalation.py         Human handoff logic + webhook
+  |   |       +-- closing.py            Summary generation + teardown
+  |   |-- telephony/
+  |   |   |-- media_stream.py       MediaStreamHandler + CallOrchestrator
+  |   |   |-- twilio_client.py      Twilio REST API wrapper
+  |   |   +-- audio_utils.py        mu-law <-> base64, frame chunking
+  |   |-- voice/
+  |   |   +-- deepgram_client.py    Deepgram STT (WS) + TTS (HTTP)
+  |   |-- memory/
+  |   |   |-- store.py              MemoryStore (pgvector insert/search)
+  |   |   +-- embeddings.py         Local HuggingFace embedding client
+  |   +-- db/
+  |       |-- models.py             SQLAlchemy ORM: Call, Transcript
+  |       |-- connection.py         Engine + session factory + healthcheck
+  |       +-- migrations/           SQL init scripts (Docker auto-runs)
+  |-- prompts/
+  |   +-- system.txt                Agent system prompt template
+  |-- scripts/
+  |   |-- test_call.py              CLI: trigger a test call
+  |   |-- seed_memory.py            Seed pgvector memory store
+  |   +-- cleanup_calls.py          Prune old call records
+  |-- tests/                        pytest test suite
+  |-- .env                          Environment secrets (never commit)
+  |-- .env.example                  Template for .env
+  |-- Dockerfile                    Python 3.11-slim container image
+  |-- docker-compose.yml            App + PostgreSQL/pgvector compose file
+  |-- requirements.txt              Python dependencies
+  +-- pyproject.toml                Project metadata + tool config
+
+
+--------------------------------------------------------------------------------
+4. WORKFLOW  (end-to-end call lifecycle)
+--------------------------------------------------------------------------------
+
+STEP  WHO                 ACTION
+----  -----------------   ----------------------------------------------------
+ 1    Client              POST /calls/initiate { to_number, context }
+
+ 2    FastAPI             Validates request; calls Twilio REST API to place
+                          outbound call with:
+                            url             = <ngrok>/webhooks/twilio/twiml
+                            status_callback = <ngrok>/webhooks/twilio/status
+
+ 3    Twilio              Dials the target phone number
+
+ 4    Twilio              On answer, POST to /webhooks/twilio/twiml
+
+ 5    FastAPI             Returns TwiML: opens Media Stream WebSocket
+                          pointing to /ws/media-stream/<call_sid>
+
+ 6    Twilio              Opens WebSocket; streams mu-law audio frames
+
+ 7    MediaStreamHandler  Opens Deepgram STT WebSocket connection
+
+ 8    Agent               greeting_node fires -- generates opening utterance
+                          TTS synthesises audio, sent to Twilio
+
+ 9    Caller              Speaks; Twilio streams mu-law frames to server
+
+10    Deepgram STT         Streams interim + final transcripts back
+                          On speech_final=true -> full utterance emitted
+
+11    CallOrchestrator    on_caller_utterance(text) runs:
+                          a. memory_retrieval_node  -> past context
+                          b. query_handler_node     -> intent classification
+                          c. If escalate  -> escalation_node + closing_node
+                             If end-call  -> closing_node
+                             Else         -> response_gen_node (Groq LLM)
+
+12    Groq LLM            Generates next agent utterance (up to 200 tokens)
+
+13    Deepgram TTS         Synthesises text -> raw 8 kHz mu-law audio bytes
+
+14    MediaStreamHandler  Chunks audio into 20 ms frames; sends to Twilio
+
+15    Twilio              Plays audio to caller  ->  repeat from step 9
+
+16    Call ends           Caller hangs up OR agent signals hang-up
+                          (end_call intent OR max turns = 20 reached)
+
+17    closing_node        Groq generates 2-3 sentence summary
+                          Transcript + summary saved to DB
+                          (InMemoryCallPersister if DB unavailable)
+
+18    Twilio              Sends status callback -> DB record updated
+
+
+--------------------------------------------------------------------------------
+5. COMMANDS TO EXECUTE (Docker + PostgreSQL)
+--------------------------------------------------------------------------------
+
+PRE-REQUISITES
+--------------
+  - Docker Desktop installed and running
+  - ngrok (ngrok.exe bundled in project root)
+  - .env file configured (copy from .env.example)
+  - Required API keys:
+      GROQ_API_KEY          -> console.groq.com
+      DEEPGRAM_API_KEY      -> console.deepgram.com
+      TWILIO_ACCOUNT_SID    -> twilio.com/console
+      TWILIO_AUTH_TOKEN     -> twilio.com/console
+      TWILIO_PHONE_NUMBER   -> a purchased Twilio number (E.164 format)
+
+
+STEP 1 -- Start ngrok tunnel  [separate terminal, keep it running]
+-------------------------------------------------------------------
+  .\ngrok.exe http 8000
+
+  Copy the HTTPS URL from ngrok output.
+  Example: https://twisty-halves-purge.ngrok-free.app
+
+  Set in .env:
+  TWILIO_WEBHOOK_BASE_URL=https://twisty-halves-purge.ngrok-free.app
+
+
+STEP 2 -- Start PostgreSQL only (first time or DB-only mode)
+------------------------------------------------------------
+  docker compose up postgres -d
+
+  # Confirm healthy
+  docker compose ps
+  # Expected: calling-agent-postgres-1   running (healthy)
+
+  # Inspect tables (after migrations applied)
+  docker compose exec postgres psql -U postgres -d calling_agent -c "\dt"
+
+
+STEP 3 -- Build & start the full stack (app + postgres)
+-------------------------------------------------------
+  docker compose up --build
+
+  # Detached / background mode
+  docker compose up --build -d
+
+  # Follow app logs
+  docker compose logs -f app
+
+  # Follow all service logs
+  docker compose logs -f
+
+
+STEP 4 -- Seed memory store (optional, first-time setup)
+---------------------------------------------------------
+  # Inside Docker
+  docker compose exec app python scripts/seed_memory.py
+
+  # Locally (with .venv active)
+  .\.venv\Scripts\python.exe scripts\seed_memory.py
+
+
+STEP 5 -- Trigger a test outbound call
+---------------------------------------
+  # Using the bundled test script
+  .\.venv\Scripts\python.exe scripts\test_call.py ^
+      --to +91XXXXXXXXXX ^
+      --scenario appointment_reminder
+
+  # Scenarios: appointment_reminder | feedback_survey
+
+  # Using PowerShell Invoke-RestMethod
+   = '{"to_number":"+91XXXXXXXXXX","context":{"customer_name":"Priya","purpose":"appointment_reminder"}}'
+  Invoke-RestMethod -Method POST 
+      -Uri "http://localhost:8000/calls/initiate" 
+      -ContentType "application/json" 
+      -Body 
+
+
+STEP 6 -- Inspect a call after it completes
+---------------------------------------------
+   = "<call_id from step 5 response>"
+
+  # Status + duration + summary
+  Invoke-RestMethod "http://localhost:8000/calls/" | Select-Object status, duration_s, summary
+
+  # Full transcript
+  (Invoke-RestMethod "http://localhost:8000/calls/").transcript | Format-Table turn_number, role, content -Wrap
+
+
+STEP 7 -- Health check
+-----------------------
+  Invoke-RestMethod "http://localhost:8000/health"
+
+
+STEP 8 -- Run tests
+---------------------
+  # Inside Docker
+  docker compose exec app pytest tests/ -v
+
+  # Locally
+  .\.venv\Scripts\python.exe -m pytest tests/ -v --cov=app
+
+
+STEP 9 -- Stop all containers
+--------------------------------
+  docker compose down
+
+  # Stop + wipe volumes (DELETES database data)
+  docker compose down -v
+
+
+STEP 10 -- Cleanup old call records
+--------------------------------------
+  # Inside Docker
+  docker compose exec app python scripts/cleanup_calls.py
+
+  # Locally
+  .\.venv\Scripts\python.exe scripts\cleanup_calls.py
+
+
+LOCAL DEVELOPMENT (without Docker)
+-----------------------------------
+  # 1. Create virtual environment
+  python -m venv .venv
+  .\.venv\Scripts\Activate.ps1
+
+  # 2. Install dependencies
+  pip install -r requirements.txt
+
+  # 3. Run server with hot-reload + debug logging
+  ="DEBUG"
+  .\.venv\Scripts\python.exe -m uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+  NOTE: Without PostgreSQL the app degrades gracefully:
+    - Call data stored in process memory (lost on server restart)
+    - pgvector / memory features disabled
+    - All voice conversation features still work normally
+
+
+ENVIRONMENT VARIABLES REFERENCE
+---------------------------------
+  Variable                  Required   Description
+  ------------------------  --------   ----------------------------------------
+  GROQ_API_KEY              YES        Groq API key
+  GROQ_CHAT_MODEL           YES        e.g. openai/gpt-oss-120b
+  DEEPGRAM_API_KEY          YES        Deepgram API key (STT + TTS)
+  TWILIO_ACCOUNT_SID        YES        Twilio Account SID
+  TWILIO_AUTH_TOKEN         YES        Twilio Auth Token
+  TWILIO_PHONE_NUMBER       YES        Caller number in E.164 format
+  TWILIO_WEBHOOK_BASE_URL   YES        Public HTTPS URL (ngrok / production)
+  DATABASE_URL              NO         PostgreSQL DSN (degrades if missing)
+  AGENT_NAME                NO         Spoken agent name   (default: Alex)
+  COMPANY_NAME              NO         Company in prompts  (default: Acme Corp)
+  MAX_TURNS_BEFORE_CLOSE    NO         Max dialogue turns  (default: 20)
+  ESCALATION_KEYWORDS       NO         Comma-separated escalation triggers
+  ESCALATION_WEBHOOK_URL    NO         Slack/Teams webhook for human handoff
+  LOG_LEVEL                 NO         DEBUG | INFO | WARNING  (default: INFO)
+  EMBEDDING_MODEL           NO         HuggingFace model  (default: all-MiniLM-L6-v2)
+  EMBEDDING_DEVICE          NO         cpu | cuda          (default: cpu)
+
+
+API ENDPOINTS REFERENCE
+------------------------
+  METHOD   ENDPOINT                        DESCRIPTION
+  ------   ----------------------------    ------------------------------------
+  GET      /health                         Health check
+  POST     /calls/initiate                 Place an outbound call
+  GET      /calls/{call_id}                Retrieve call record + transcript
+  POST     /webhooks/twilio/twiml          Twilio answer webhook (returns TwiML)
+  POST     /webhooks/twilio/status         Twilio call lifecycle status events
+  WS       /ws/media-stream/{call_sid}     Twilio Media Stream WebSocket
+
+
+================================================================================
+  Generated : 2026-10-15
+  Project   : AI Outbound Calling Agent (calling-agent)
+================================================================================
